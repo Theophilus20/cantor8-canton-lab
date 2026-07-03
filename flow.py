@@ -80,6 +80,31 @@ def setup_preapproval(token):
     return _post(url, token, payload)
 
 
+# --- Step 2b: list & accept incoming transfer offers -----------------------
+# Because no TransferPreapproval is set up, coins sent to us arrive as a
+# legacy Splice.Wallet.TransferOffer that must be explicitly accepted.
+# These wallet endpoints are DEPRECATED and require the JWT subject to be our
+# own user; with a client_credentials token they may return 401/403 — if so,
+# that's a documented limitation (see FEEDBACK.md), not a code bug.
+WALLET_BASE = ADMIN_BASE  # same validator base: /api/validator
+
+def accept_offers(token):
+    list_url = f"{WALLET_BASE}/v0/wallet/transfer-offers"
+    offers = _get(list_url, token)
+    items = offers.get("offers", offers) if isinstance(offers, dict) else offers
+    print("transfer offers found:", len(items) if hasattr(items, "__len__") else items)
+    accepted = 0
+    for o in (items or []):
+        cid = o.get("contract_id") or o.get("contractId") or o.get("cid")
+        if not cid:
+            continue
+        acc_url = f"{WALLET_BASE}/v0/wallet/transfer-offers/{cid}/accept"
+        _post(acc_url, token, {})
+        accepted += 1
+    print("offers accepted:", accepted)
+    return accepted
+
+
 # --- Step 3/4: check ACS, filter over Holding interface --------------------
 def check_acs(token):
     # ⚠️ VERIFY: ACS query on JSON Ledger API. Often an active-contracts
@@ -104,8 +129,73 @@ def check_acs(token):
         ]}}},
     }
     out = _post(url, token, payload)
-    print("ACS entries:", len(out) if isinstance(out, list) else "see body")
+    n = len(out) if isinstance(out, list) else "see body"
+    print("Holding-filtered ACS entries:", n)
+
+    # --- Second pass: show ALL active contracts for this party (wildcard) ---
+    # If coins arrived as a pending TransferOffer (not a Holding), the filtered
+    # query above misses it. This wildcard pass reveals whatever actually landed.
+    wildcard = {
+        "verbose": True,
+        "activeAtOffset": offset,
+        "filter": {"filtersByParty": {pid: {"cumulative": [
+            {"identifierFilter": {"WildcardFilter": {"value": {
+                "includeCreatedEventBlob": False
+            }}}}
+        ]}}},
+    }
+    all_out = _post(url, token, wildcard)
+    if isinstance(all_out, list):
+        print("TOTAL active contracts for party:", len(all_out))
+        import re
+        from collections import Counter
+        blob = json.dumps(all_out)
+        tids = re.findall(r'"templateId"\s*:\s*"([^"]+)"', blob)
+        for t, c in Counter(tids).items():
+            print(f"  {c} x {t}")
+        # capture the AmuletTransferInstruction contractId so we can accept it
+        for row in all_out:
+            rj = json.dumps(row)
+            if "AmuletTransferInstruction" in rj:
+                m = re.search(r'"contractId"\s*:\s*"([^"]+)"', rj)
+                if m:
+                    STATE["transfer_instruction_cid"] = m.group(1)
+                    print("  -> transfer instruction cid:", m.group(1))
+    else:
+        print("wildcard ACS: see body")
     return out
+
+
+# --- Step 5: accept the incoming Token Standard transfer instruction --------
+def accept_instruction(token):
+    cid = STATE.get("transfer_instruction_cid")
+    pid = STATE.get("party_id")
+    if not cid:
+        print("no transfer instruction to accept.")
+        return
+    import uuid
+    url = f"{LEDGER_JSON_SYNC}/v2/commands/submit-and-wait"
+    iface = "#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction"
+    payload = {
+        "commands": [{
+            "ExerciseCommand": {
+                "templateId": iface,          # exercise via the interface
+                "contractId": cid,
+                "choice": "TransferInstruction_Accept",
+                "choiceArgument": {
+                    "extraArgs": {
+                        "context": {"values": {}},   # may need disclosed contracts
+                        "meta": {"values": {}},
+                    }
+                },
+            }
+        }],
+        "commandId": f"accept-{uuid.uuid4()}",
+        "userId": "hackathon",
+        "actAs": [pid],
+        "readAs": [pid],
+    }
+    return _post(url, token, payload)
 
 
 if __name__ == "__main__":
@@ -117,5 +207,19 @@ if __name__ == "__main__":
     except Exception as e:
         print("\n[preapproval skipped — expected until CCs/params available]")
         print("  reason:", str(e)[:200], "\n")
+    try:
+        accept_offers(tok)   # accept any incoming coin offers (no preapproval set)
+    except Exception as e:
+        print("\n[accept_offers skipped — wallet endpoint may be deprecated/forbidden]")
+        print("  reason:", str(e)[:200], "\n")
+    check_acs(tok)
+    # Now try to accept the incoming Token Standard transfer instruction:
+    try:
+        accept_instruction(tok)
+    except Exception as e:
+        print("\n[accept_instruction failed — may need disclosed registry context]")
+        print("  reason:", str(e)[:300], "\n")
+    # Re-check ACS to see if a Holding (balance) now exists:
+    print("\n=== ACS after accept ===")
     check_acs(tok)
     print("\nSTATE:", json.dumps(STATE, indent=2, default=str))
